@@ -1,0 +1,28 @@
+[package]
+name = "nexus-server"
+description = "NexusMesh control plane: node registry, IPAM, STUN responder, and NAT-traversal signaling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nexus-server"
+path = "src/main.rs"
+
+[dependencies]
+nexus-core.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

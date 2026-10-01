@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pyc
+.DS_Store
+/dist
+*.db
+*.db-journal
+.env
