@@ -85,3 +85,53 @@ pub fn decode<'a, T: Deserialize<'a>>(line: &'a str) -> Result<T> {
     serde_json::from_str(line.trim_end())
         .map_err(|e| NexusError::Ipc(format!("invalid IPC frame: {e}")))
 }
+
+/// Synchronous request/response against a running `nexus-agent` socket.
+/// Used by `nexus` and `nexus-tui` — neither needs an async runtime.
+#[cfg(unix)]
+pub fn request(path: &std::path::Path, req: &IpcRequest) -> Result<IpcResponse> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(path)
+        .map_err(|e| NexusError::Ipc(format!("connect {}: {e}", path.display())))?;
+    stream.write_all(encode(req)?.as_bytes())?;
+    let mut line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut line)?;
+    if line.is_empty() {
+        return Err(NexusError::Ipc("daemon closed the connection".into()));
+    }
+    decode(&line)
+}
+
+/// Human-readable byte count (`1.5 MiB`).
+pub fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} {}", UNITS[u])
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Human-readable bit/byte rate (`812 B/s`, `4.2 KiB/s`).
+pub fn human_rate(bps: f64) -> String {
+    const UNITS: [&str; 5] = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"];
+    let mut v = bps.max(0.0);
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if v >= 100.0 || u == 0 {
+        format!("{v:.0} {}", UNITS[u])
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}

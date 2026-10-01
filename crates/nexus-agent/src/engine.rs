@@ -1072,7 +1072,12 @@ impl Engine {
             } => {
                 if matches!(self.phase, Phase::Down) {
                     self.pending_connect.push(reply);
-                    self.begin_connect(server_url, Some(authkey));
+                    let authkey = if authkey.is_empty() {
+                        None
+                    } else {
+                        Some(authkey)
+                    };
+                    self.begin_connect(server_url, authkey);
                 } else {
                     let _ = reply.send(IpcResponse::Ok {
                         message: format!("already {}", self.phase.as_str()),
