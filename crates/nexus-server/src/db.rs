@@ -1,0 +1,399 @@
+//! Embedded SQLite persistence: auth keys, node registry, and IPAM for
+//! `100.64.0.0/16` (CGNAT space — the mesh's virtual subnet).
+
+use anyhow::{bail, Context, Result};
+use nexus_core::crypto::{generate_authkey, sha256};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Mesh overlay prefix: `100.64.0.0/16`.
+pub const MESH_PREFIX: [u8; 2] = [100, 64];
+/// First host assignable to nodes (100.64.0.0 is network, .0.1 reserved for
+/// a potential future in-band control address).
+pub const FIRST_HOST: u32 = 2;
+/// Last host assignable to nodes (100.64.255.254).
+pub const LAST_HOST: u32 = 65534;
+
+pub fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Convert a 16-bit host number to the overlay address `100.64.hi.lo`.
+pub fn vip_from_host(host: u32) -> Ipv4Addr {
+    Ipv4Addr::new(
+        MESH_PREFIX[0],
+        MESH_PREFIX[1],
+        (host >> 8) as u8,
+        host as u8,
+    )
+}
+
+/// An issued auth-key row (plaintext keys are never stored — only hashes).
+#[derive(Debug, Clone)]
+pub struct KeyRow {
+    pub hash: String,
+    pub label: String,
+    pub reusable: bool,
+    pub created_at: i64,
+    pub used_at: Option<i64>,
+}
+
+/// A registered node row.
+#[derive(Debug, Clone)]
+pub struct NodeRow {
+    pub id: u64,
+    pub name: String,
+    pub identity_pub: String,
+    pub wg_pub: String,
+    pub vip: Ipv4Addr,
+    pub created_at: i64,
+    pub last_seen: i64,
+    /// Last reported public endpoint candidate list (comma-separated).
+    pub endpoints: Vec<SocketAddr>,
+}
+
+pub struct Db {
+    conn: Connection,
+}
+
+impl Db {
+    /// Open (or create) the database and run migrations.
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening database {}", path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS auth_keys (
+                key_hash   TEXT PRIMARY KEY,
+                label      TEXT NOT NULL DEFAULT '',
+                reusable   INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                used_at    INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS nodes (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                identity_pub TEXT NOT NULL UNIQUE,
+                wg_pub       TEXT NOT NULL UNIQUE,
+                vip          TEXT NOT NULL UNIQUE,
+                vip_host     INTEGER NOT NULL UNIQUE,
+                token_hash   TEXT NOT NULL,
+                created_at   INTEGER NOT NULL,
+                last_seen    INTEGER NOT NULL DEFAULT 0,
+                endpoints    TEXT NOT NULL DEFAULT ''
+            );
+            ",
+        )?;
+        Ok(Self { conn })
+    }
+
+    /// In-memory handle for tests.
+    #[cfg(test)]
+    pub fn open_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS auth_keys (
+                key_hash   TEXT PRIMARY KEY,
+                label      TEXT NOT NULL DEFAULT '',
+                reusable   INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                used_at    INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS nodes (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                identity_pub TEXT NOT NULL UNIQUE,
+                wg_pub       TEXT NOT NULL UNIQUE,
+                vip          TEXT NOT NULL UNIQUE,
+                vip_host     INTEGER NOT NULL UNIQUE,
+                token_hash   TEXT NOT NULL,
+                created_at   INTEGER NOT NULL,
+                last_seen    INTEGER NOT NULL DEFAULT 0,
+                endpoints    TEXT NOT NULL DEFAULT ''
+            );
+            ",
+        )?;
+        Ok(Self { conn })
+    }
+
+    // ---------------- auth keys ----------------
+
+    /// Issue a fresh `nexus_sec_…` key. Returns the plaintext key — only the
+    /// SHA-256 hash is persisted.
+    pub fn issue_key(&self, label: &str, reusable: bool) -> Result<String> {
+        let key = generate_authkey();
+        let hash = hex::encode(sha256(key.as_bytes()));
+        self.conn.execute(
+            "INSERT INTO auth_keys (key_hash, label, reusable, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![hash, label, reusable as i64, now_secs()],
+        )?;
+        Ok(key)
+    }
+
+    /// Check an auth key; on success consume it (non-reusable keys are marked
+    /// used and cannot be redeemed twice).
+    pub fn consume_key(&self, key: &str) -> Result<bool> {
+        let hash = hex::encode(sha256(key.as_bytes()));
+        let row: Option<(i64, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT reusable, used_at FROM auth_keys WHERE key_hash = ?1",
+                params![hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => Ok(false),
+            Some((_, Some(_))) => Ok(false), // already consumed
+            Some((1, None)) => Ok(true),     // reusable: leave it usable
+            Some((0, None)) => {
+                self.conn.execute(
+                    "UPDATE auth_keys SET used_at = ?1 WHERE key_hash = ?2",
+                    params![now_secs(), hash],
+                )?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn list_keys(&self) -> Result<Vec<KeyRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT key_hash, label, reusable, created_at, used_at FROM auth_keys ORDER BY created_at",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(KeyRow {
+                    hash: r.get::<_, String>(0)?,
+                    label: r.get::<_, String>(1)?,
+                    reusable: r.get::<_, i64>(2)? != 0,
+                    created_at: r.get::<_, i64>(3)?,
+                    used_at: r.get::<_, Option<i64>>(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ---------------- nodes ----------------
+
+    /// Allocate the lowest free VIP in `100.64.0.0/16`.
+    fn alloc_vip(&self) -> Result<(Ipv4Addr, i64)> {
+        let mut st = self.conn.prepare("SELECT vip_host FROM nodes")?;
+        let used: std::collections::HashSet<i64> = st
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for host in FIRST_HOST..=LAST_HOST {
+            if !used.contains(&(host as i64)) {
+                return Ok((vip_from_host(host), host as i64));
+            }
+        }
+        bail!("address pool exhausted ({} nodes)", used.len())
+    }
+
+    /// Insert a node row. Returns `(node_id, vip)`.
+    pub fn register_node(
+        &self,
+        name: &str,
+        identity_pub: &str,
+        wg_pub: &str,
+        token: &str,
+        endpoints: &[SocketAddr],
+    ) -> Result<(u64, Ipv4Addr)> {
+        let (vip, vip_host) = self.alloc_vip()?;
+        let token_hash = hex::encode(sha256(token.as_bytes()));
+        let ep_str = endpoints
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let now = now_secs();
+        self.conn.execute(
+            "INSERT INTO nodes (name, identity_pub, wg_pub, vip, vip_host, token_hash, created_at, last_seen, endpoints)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+            params![name, identity_pub, wg_pub, vip.to_string(), vip_host, token_hash, now, ep_str],
+        )?;
+        Ok((self.conn.last_insert_rowid() as u64, vip))
+    }
+
+    /// Look a node up by bearer token (hashed comparison).
+    pub fn node_by_token(&self, token: &str) -> Result<Option<NodeRow>> {
+        let hash = hex::encode(sha256(token.as_bytes()));
+        self.conn
+            .query_row(
+                "SELECT id, name, identity_pub, wg_pub, vip, created_at, last_seen, endpoints
+                 FROM nodes WHERE token_hash = ?1",
+                params![hash],
+                row_to_node,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn node_by_id(&self, id: u64) -> Result<Option<NodeRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, name, identity_pub, wg_pub, vip, created_at, last_seen, endpoints
+                 FROM nodes WHERE id = ?1",
+                params![id as i64],
+                row_to_node,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_nodes(&self) -> Result<Vec<NodeRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, name, identity_pub, wg_pub, vip, created_at, last_seen, endpoints
+             FROM nodes ORDER BY vip_host",
+        )?;
+        let rows = st
+            .query_map([], row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_endpoints(&self, id: u64, endpoints: &[SocketAddr]) -> Result<()> {
+        let ep_str = endpoints
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn.execute(
+            "UPDATE nodes SET endpoints = ?1, last_seen = ?2 WHERE id = ?3",
+            params![ep_str, now_secs(), id as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch(&self, id: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE nodes SET last_seen = ?1 WHERE id = ?2",
+            params![now_secs(), id as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Rotate a node's bearer token. Returns the new token.
+    pub fn rotate_token(&self, id: u64) -> Result<String> {
+        let token = nexus_core::crypto::generate_session_token();
+        let hash = hex::encode(sha256(token.as_bytes()));
+        self.conn.execute(
+            "UPDATE nodes SET token_hash = ?1 WHERE id = ?2",
+            params![hash, id as i64],
+        )?;
+        Ok(token)
+    }
+
+    pub fn remove_node(&self, id: u64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM nodes WHERE id = ?1", params![id as i64])?
+            > 0)
+    }
+}
+
+fn row_to_node(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRow> {
+    let vip_str: String = r.get(4)?;
+    let ep_str: String = r.get(7)?;
+    Ok(NodeRow {
+        id: r.get::<_, i64>(0)? as u64,
+        name: r.get(1)?,
+        identity_pub: r.get(2)?,
+        wg_pub: r.get(3)?,
+        vip: vip_str.parse().unwrap_or(Ipv4Addr::UNSPECIFIED),
+        created_at: r.get(5)?,
+        last_seen: r.get(6)?,
+        endpoints: ep_str
+            .split(',')
+            .filter_map(|s| s.trim().parse::<SocketAddr>().ok())
+            .collect(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Db {
+        Db::open_memory().unwrap()
+    }
+
+    fn ep(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn authkey_issue_and_consume() {
+        let db = test_db();
+        let key = db.issue_key("laptop", false).unwrap();
+        assert!(key.starts_with("nexus_sec_"));
+        assert!(db.consume_key(&key).unwrap());
+        // Single-use: second consume fails.
+        assert!(!db.consume_key(&key).unwrap());
+        // Unknown key fails.
+        assert!(!db.consume_key("nexus_sec_deadbeef").unwrap());
+    }
+
+    #[test]
+    fn reusable_key_survives_consume() {
+        let db = test_db();
+        let key = db.issue_key("fleet", true).unwrap();
+        assert!(db.consume_key(&key).unwrap());
+        assert!(db.consume_key(&key).unwrap());
+    }
+
+    #[test]
+    fn ipam_allocates_incrementally_and_reuses_freed() {
+        let db = test_db();
+        let (id1, vip1) = db
+            .register_node("a", "id_a", "wg_a", "tok1", &[ep("1.2.3.4:51820")])
+            .unwrap();
+        let (_id2, vip2) = db.register_node("b", "id_b", "wg_b", "tok2", &[]).unwrap();
+        assert_eq!(vip1, Ipv4Addr::new(100, 64, 0, 2));
+        assert_eq!(vip2, Ipv4Addr::new(100, 64, 0, 3));
+        // Free vip1, re-register → lowest free is .0.2 again.
+        db.remove_node(id1).unwrap();
+        let (_, vip3) = db.register_node("c", "id_c", "wg_c", "tok3", &[]).unwrap();
+        assert_eq!(vip3, Ipv4Addr::new(100, 64, 0, 2));
+    }
+
+    #[test]
+    fn token_lookup_and_rotation() {
+        let db = test_db();
+        let (id, _) = db
+            .register_node("x", "id_x", "wg_x", "tok_old", &[])
+            .unwrap();
+        assert!(db.node_by_token("tok_old").unwrap().is_some());
+        let new_tok = db.rotate_token(id).unwrap();
+        assert!(db.node_by_token("tok_old").unwrap().is_none());
+        assert_eq!(db.node_by_token(&new_tok).unwrap().unwrap().id, id);
+    }
+
+    #[test]
+    fn endpoints_persist() {
+        let db = test_db();
+        let (id, _) = db
+            .register_node("e", "id_e", "wg_e", "tok", &[ep("10.0.0.5:51820")])
+            .unwrap();
+        db.update_endpoints(id, &[ep("203.0.113.9:51820"), ep("192.168.1.5:51820")])
+            .unwrap();
+        let n = db.node_by_id(id).unwrap().unwrap();
+        assert_eq!(
+            n.endpoints,
+            vec![ep("203.0.113.9:51820"), ep("192.168.1.5:51820")]
+        );
+    }
+}
