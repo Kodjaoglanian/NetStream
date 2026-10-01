@@ -215,7 +215,7 @@ fn chrono_free_ts(secs: i64) -> String {
     format!("{year:04}-{mo:02}-{d:02} {h:02}:{m:02}Z")
 }
 
-async fn serve(listen: SocketAddr, stun_listen: SocketAddr, db_path: &PathBuf) -> Result<()> {
+async fn serve(listen: SocketAddr, stun_listen: SocketAddr, db_path: &Path) -> Result<()> {
     let db = open_db(db_path)?;
     let stun_port = stun_listen.port();
     let state = Arc::new(AppState::new(db, stun_port));
