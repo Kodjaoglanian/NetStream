@@ -10,8 +10,11 @@ use tokio::io::unix::AsyncFd;
 
 const IFF_TUN: i16 = 0x0001;
 const IFF_NO_PI: i16 = 0x1000;
-const TUNSETIFF: libc::c_ulong = 0x400454ca;
-const TUNGETIFF: libc::c_ulong = 0x800454d2;
+// ioctl request codes — `u64` here because libc's ioctl request type differs
+// between glibc (c_ulong) and musl (c_int); the `as _` casts below pick the
+// target's `Ioctl` type.
+const TUNSETIFF: u64 = 0x400454ca;
+const TUNGETIFF: u64 = 0x800454d2;
 
 /// `struct ifreq` — we only need name + flags (start of the union).
 #[repr(C)]
@@ -50,7 +53,7 @@ impl TunDevice {
             _pad: [0; 22],
         };
         req.ifr_name[..6].copy_from_slice(b"nexus%d");
-        if unsafe { libc::ioctl(raw, TUNSETIFF, &req) } < 0 {
+        if unsafe { libc::ioctl(raw, TUNSETIFF as _, &req) } < 0 {
             return Err(io::Error::last_os_error()).context("ioctl TUNSETIFF failed");
         }
 
@@ -60,7 +63,7 @@ impl TunDevice {
             ifr_flags: 0,
             _pad: [0; 22],
         };
-        if unsafe { libc::ioctl(raw, TUNGETIFF, &mut name_req) } < 0 {
+        if unsafe { libc::ioctl(raw, TUNGETIFF as _, &mut name_req) } < 0 {
             return Err(io::Error::last_os_error()).context("ioctl TUNGETIFF failed");
         }
         let len = name_req.ifr_name.iter().position(|&c| c == 0).unwrap_or(16);
