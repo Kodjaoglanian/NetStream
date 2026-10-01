@@ -10,6 +10,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+  checks: write        # rustsec/audit-check posts annotations as check runs
+  security-events: write
+
 jobs:
   fmt-audit:
     name: fmt + audit
