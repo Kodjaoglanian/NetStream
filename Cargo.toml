@@ -45,7 +45,7 @@ zeroize = { version = "1", features = ["derive"] }
 # HTTP / WebSocket control plane
 axum = { version = "0.7", features = ["ws"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "0.26"
 
 # Terminal UI
