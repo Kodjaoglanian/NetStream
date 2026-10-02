@@ -62,7 +62,7 @@ impl PeerInfo {
     }
 }
 
-/// POST `/v1/endpoint` — agent reports refreshed endpoint candidates.
+/// POST `/v1/endpoints` — agent reports refreshed endpoint candidates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointReport {
     pub endpoints: Vec<String>,
@@ -117,7 +117,7 @@ pub enum SignalMessage {
     Heartbeat,
 }
 
-/// GET `/health` response.
+/// GET `/healthz` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,

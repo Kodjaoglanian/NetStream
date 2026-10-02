@@ -26,10 +26,11 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ApiError
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/register", post(register))
-        .route("/v1/peers", get(list_peers))
-        .route("/v1/endpoint", post(report_endpoint))
+        .route("/v1/nodes", get(list_nodes))
+        .route("/v1/nodes/self", get(get_self))
+        .route("/v1/endpoints", post(report_endpoints))
         .route("/v1/signal", get(signal::ws_handler))
-        .route("/health", get(health))
+        .route("/healthz", get(health))
         .route("/metrics", get(metrics))
         .with_state(state)
 }
@@ -129,24 +130,37 @@ async fn register(
     }))
 }
 
-async fn list_peers(
+async fn list_nodes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> ApiResult<Json<Vec<nexus_core::protocol::PeerInfo>>> {
+) -> ApiResult<Json<serde_json::Value>> {
     state.metrics.http_requests.fetch_add(1, Ordering::Relaxed);
-    let me = auth_node(&state, &headers)?;
-    let peers = state
+    auth_node(&state, &headers)?;
+    let nodes: Vec<_> = state
         .db()
         .list_nodes()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_iter()
-        .filter(|n| n.id != me.id)
-        .map(|n| state.peer_info(&n))
+        .iter()
+        .map(|n| state.peer_info(n))
         .collect();
-    Ok(Json(peers))
+    Ok(Json(serde_json::json!({ "nodes": nodes })))
 }
 
-async fn report_endpoint(
+async fn get_self(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<nexus_core::protocol::PeerInfo>> {
+    state.metrics.http_requests.fetch_add(1, Ordering::Relaxed);
+    let me = auth_node(&state, &headers)?;
+    let node = state
+        .db()
+        .node_by_id(me.id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "node record missing"))?;
+    Ok(Json(state.peer_info(&node)))
+}
+
+async fn report_endpoints(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<EndpointReport>,
